@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.planner import PlanError, plan_reads
@@ -107,3 +109,94 @@ def test_unsorted_input_returns_original_indexes():
     )
     # 全部并入一段（20..0 含 21 个寄存器，<= 上限 32），point_indexes 保留请求下标
     assert seg_tuples(segs) == [(0, 20, (1, 2, 0))]
+
+
+def test_duplicate_points_list_every_original_index():
+    # 同址同字数重复 3 条，再带一个相邻测点；规划只看去重测点，
+    # 但读段必须列全所有原下标
+    segs = plan_reads(
+        points=[(3, 1), (3, 1), (4, 1), (3, 1)],
+        range_start=0,
+        range_end=99,
+        max_read=16,
+    )
+    assert seg_tuples(segs) == [(3, 4, (0, 1, 3, 2))]
+
+
+def test_same_address_different_words_form_distinct_groups():
+    # 地址 10：两条单字（下标 0、1）+ 一条双字占 10..11（下标 2），
+    # 再加地址 11 的单字（下标 3）。去重后 3 个测点，全部并入 10..11 一段。
+    segs = plan_reads(
+        points=[(10, 1), (10, 1), (10, 2), (11, 1)],
+        range_start=0,
+        range_end=99,
+        max_read=8,
+    )
+    assert seg_tuples(segs) == [(10, 11, (0, 1, 2, 3))]
+
+    # 上限 2 时：10..11 一段即可同时完整覆盖双字（10..11）与 11 的单字，
+    # 仍是一段；段内按 (address, words) 排序后展开原下标
+    segs = plan_reads(
+        points=[(10, 1), (10, 1), (10, 2), (11, 1)],
+        range_start=0,
+        range_end=99,
+        max_read=2,
+    )
+    assert seg_tuples(segs) == [(10, 11, (0, 1, 2, 3))]
+
+
+def test_duplicate_rows_do_not_inflate_plan_cost():
+    # 同一批去重测点：重复 1 条与重复 200 条，方案（读段与计数）必须完全一致
+    base = [(0, 1), (5, 1), (6, 2), (8, 1)]
+    once = plan_reads(points=base, range_start=0, range_end=99, max_read=6)
+    many = plan_reads(
+        points=base * 200,
+        range_start=0,
+        range_end=99,
+        max_read=6,
+    )
+    # 读段起止与字数一致
+    assert [(s.start, s.end, s.count) for s in many] == [
+        (s.start, s.end, s.count) for s in once
+    ]
+    # 每组原下标都按重复次数展开，且总数等于提交条数
+    assert sum(len(s.point_indexes) for s in many) == len(base) * 200
+    for seg in many:
+        assert all(0 <= idx < len(base) * 200 for idx in seg.point_indexes)
+    # 最优性不变：2 次请求、共 5 个寄存器
+    assert len(many) == 2
+    assert sum(s.count for s in many) == 5
+
+
+def test_planning_time_does_not_grow_quadratically_with_duplicate_rows():
+    # 去重后测点数固定为 200 个稀疏单字，重复条数从 10 提到 10000；
+    # 去重后规划开销与重复条数无关，耗时不应随条数平方放大。
+    distinct = [(a * 10, 1) for a in range(200)]
+
+    def elapsed(rows: int) -> float:
+        repeats, tail = divmod(rows, len(distinct))
+        payload = distinct * repeats + distinct[:tail]
+        start = time.perf_counter()
+        plan_reads(points=payload, range_start=0, range_end=100000, max_read=4)
+        return time.perf_counter() - start
+
+    small = elapsed(200)
+    huge = elapsed(10000)
+    # 宽松上限防抖动；旧的 O(n^2) 实现在该数据量下需数秒，必然超界
+    assert huge < 1.0
+    assert huge < max(small * 10, 0.2)
+
+
+def test_massive_duplicates_at_one_address_remain_fast():
+    # 最极端场景：同一单字测点重复 20000 条，去重后 m=1，规划应近乎瞬时
+    start = time.perf_counter()
+    segs = plan_reads(
+        points=[(42, 1)] * 20000,
+        range_start=0,
+        range_end=99,
+        max_read=16,
+    )
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0
+    assert len(segs) == 1
+    assert segs[0].point_indexes == tuple(range(20000))

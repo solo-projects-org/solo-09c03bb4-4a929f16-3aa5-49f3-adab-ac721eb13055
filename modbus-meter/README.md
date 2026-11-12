@@ -14,24 +14,31 @@ docker compose up --build
 - API：<http://localhost:8000>，Swagger UI：<http://localhost:8000/docs>
 - 模拟电表：`localhost:1502`（容器内 `meter:502`），保持寄存器 0..99
 
-在 Swagger 中打开 `POST /read` → Try it out → 直接 Execute 即可对模拟表试采
-（请求体默认指向容器内的模拟表）。也可在宿主机用 curl：
+在 Swagger 中打开 `POST /read` → Try it out，请求体示例已内置一份
+**重复单字 + 同址双字一起试采**的样例（地址 10 两条单字、一条双字，
+另有 12、20 的单字），直接 Execute 即可对模拟表试采（默认指向容器内的
+模拟表）。也可在宿主机用 curl：
 
 ```bash
 curl -X POST http://localhost:8000/read \
   -H 'Content-Type: application/json' \
   -d '{
     "points": [
-      {"address": 0, "words": 2},
-      {"address": 2, "words": 2},
       {"address": 10, "words": 1},
-      {"address": 12, "words": 1}
+      {"address": 10, "words": 1},
+      {"address": 10, "words": 2},
+      {"address": 12, "words": 1},
+      {"address": 20, "words": 1}
     ],
     "range_start": 0,
     "range_end": 99,
     "max_read": 8
   }'
 ```
+
+同址同字数的重复测点只参与一次规划，响应里每条测点仍按提交顺序逐条返回，
+每个读段的 `point_indexes` 会列全对应的原下标；同址但字数不同的测点
+（如上例地址 10 的单字与双字）按各自字数独立解码。
 
 ## 接口说明
 
@@ -53,12 +60,20 @@ curl -X POST http://localhost:8000/read \
 3. 先使请求次数最少；次数相同时使读取寄存器总数最少
    （按地址排序后动态规划求解，读段紧贴测点，不多读无用寄存器）。
 
+合并清单后常见的同址同字数重复测点对规划完全等价：规划前先按
+`(address, words)` 去重，动态规划只在去重后的测点上进行，因此规划开销为
+O(m²)（m 为去重后测点数），不随同一测点的重复条数 n 平方增长；重建读段时
+再把每组测点的全部原下标展开回去。规划是纯 CPU 计算，接口通过
+`asyncio.to_thread` 放在工作线程执行，大批测点规划期间事件循环仍可调度，
+其他电表的小批试采请求不会被拖住。
+
 响应（200）：
 
 - `request_count` / `total_registers`：实际请求次数与读取寄存器总数；
-- `segments`：各读段的起止地址（含）、字数、覆盖的测点下标、原始寄存器值；
-- `points`：按请求下标返回的测点值，`value` 为无符号计数，
-  双字按高字在前（big-endian）拼接。
+- `segments`：各读段的起止地址（含）、字数、覆盖的测点下标（重复测点的原下标
+  全部列出）、原始寄存器值；
+- `points`：按请求下标（提交顺序）逐条返回的测点值，`value` 为无符号计数，
+  双字按高字在前（big-endian）拼接；同址不同字数的测点各自按自己的字数解码。
 
 错误：
 
@@ -83,7 +98,7 @@ curl -X POST http://localhost:8000/read \
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 METER_PORT=1502 .venv/bin/python -m simulator.meter_sim &
 METER_HOST=127.0.0.1 METER_PORT=1502 .venv/bin/uvicorn app.main:app --port 8000
-.venv/bin/pytest            # 13 个用例：规划算法 + API 集成
+.venv/bin/pytest            # 21 个用例：规划算法（含去重/性能）+ API 集成
 ```
 
 环境变量：`METER_HOST` / `METER_PORT` / `METER_SLAVE_ID` / `METER_TIMEOUT`
@@ -92,8 +107,8 @@ METER_HOST=127.0.0.1 METER_PORT=1502 .venv/bin/uvicorn app.main:app --port 8000
 ## 目录结构
 
 ```
-app/main.py        FastAPI 接口与读表执行
-app/planner.py     读段规划（动态规划：次数最少 -> 寄存器总数最少）
+app/main.py        FastAPI 接口与读表执行（规划在工作线程执行，不阻塞事件循环）
+app/planner.py     读段规划（同址同字数去重 + 动态规划：次数最少 -> 寄存器总数最少）
 simulator/         pymodbus 内存模拟电表
 tests/             规划单元测试 + API 集成测试（内存模拟表，无需 Docker）
 docker-compose.yml api + meter 两个服务

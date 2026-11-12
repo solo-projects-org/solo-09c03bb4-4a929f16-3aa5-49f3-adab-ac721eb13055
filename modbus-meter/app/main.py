@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 from fastapi import FastAPI, HTTPException
@@ -31,6 +32,33 @@ class ReadRequest(BaseModel):
     port: int = Field(default=DEFAULT_PORT, ge=1, le=65535, description="Modbus TCP 端口")
     slave_id: int = Field(default=DEFAULT_SLAVE, ge=1, le=247, description="从站 / 单元号")
     timeout: float = Field(default=DEFAULT_TIMEOUT, gt=0, le=30, description="连接与读取超时（秒）")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "summary": "重复单字 + 同址双字一起试采（默认指向 Compose 模拟表）",
+                    "description": (
+                        "地址 10 提交两条单字测点与一条双字测点：单字各解 1 个寄存器，"
+                        "双字按高字在前拼接 2 个寄存器；每条测点在 segments 的 "
+                        "point_indexes 中都能找到自己的原下标。"
+                    ),
+                    "value": {
+                        "points": [
+                            {"address": 10, "words": 1},
+                            {"address": 10, "words": 1},
+                            {"address": 10, "words": 2},
+                            {"address": 12, "words": 1},
+                            {"address": 20, "words": 1},
+                        ],
+                        "range_start": 0,
+                        "range_end": 99,
+                        "max_read": 8,
+                    },
+                }
+            ]
+        }
+    }
 
     @model_validator(mode="after")
     def _check_range(self) -> "ReadRequest":
@@ -97,12 +125,15 @@ def root() -> dict[str, str]:
     },
 )
 async def read_meter(req: ReadRequest) -> ReadResponse:
+    # 规划是纯 CPU 计算：放到工作线程执行，避免大批测点规划时长期占用事件循环，
+    # 拖住其他电表的小批试采请求。
     try:
-        segments: list[Segment] = plan_reads(
-            points=[(p.address, p.words) for p in req.points],
-            range_start=req.range_start,
-            range_end=req.range_end,
-            max_read=req.max_read,
+        segments: list[Segment] = await asyncio.to_thread(
+            plan_reads,
+            [(p.address, p.words) for p in req.points],
+            req.range_start,
+            req.range_end,
+            req.max_read,
         )
     except PlanError as exc:
         # 规划阶段失败：尚未与设备通信
